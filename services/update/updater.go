@@ -123,9 +123,13 @@ func (u *Manager) updateFeed(ctx context.Context, feedConfig *feed.Config) error
 	log.Debugf("received %d episode(s) for %q", len(result.Episodes), result.Title)
 
 	episodeSet := make(map[string]struct{})
+	cleanedSet := make(map[string]struct{})
 	if err := u.db.WalkEpisodes(ctx, feedConfig.ID, func(episode *model.Episode) error {
 		if episode.Status != model.EpisodeDownloaded && episode.Status != model.EpisodeCleaned {
 			episodeSet[episode.ID] = struct{}{}
+		}
+		if episode.Status == model.EpisodeCleaned {
+			cleanedSet[episode.ID] = struct{}{}
 		}
 		return nil
 	}); err != nil {
@@ -149,6 +153,27 @@ func (u *Manager) updateFeed(ctx context.Context, feedConfig *feed.Config) error
 		}
 	}
 
+	// Cleanup clears title and description from cleaned episodes. Restore them from the
+	// latest API response so that filters can evaluate these fields correctly if the
+	// episode is later re-queued for download (e.g. after max_age is expanded).
+	for _, apiEp := range result.Episodes {
+		if _, isCleaned := cleanedSet[apiEp.ID]; !isCleaned {
+			continue
+		}
+		ep := apiEp
+		if err := u.db.UpdateEpisode(feedConfig.ID, ep.ID, func(stored *model.Episode) error {
+			stored.Title = ep.Title
+			stored.Description = ep.Description
+			stored.Thumbnail = ep.Thumbnail
+			stored.Duration = ep.Duration
+			stored.PubDate = ep.PubDate
+			stored.VideoURL = ep.VideoURL
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+
 	log.Debug("successfully saved updates to storage")
 	return nil
 }
@@ -168,9 +193,21 @@ func (u *Manager) fetchEpisodes(ctx context.Context, feedConfig *feed.Config) ([
 			logger = log.WithFields(log.Fields{"episode_id": episode.ID})
 		)
 		if episode.Status != model.EpisodeNew && episode.Status != model.EpisodeError {
-			// File already downloaded
-			logger.Infof("skipping due to already downloaded")
-			return nil
+			if episode.Status == model.EpisodeCleaned {
+				// Re-evaluate cleaned episodes: if the file is gone and the episode now passes
+				// filters (e.g. max_age was expanded), allow it to be re-queued for download.
+				episodeName := feed.EpisodeName(feedConfig, episode)
+				_, sizeErr := u.fs.Size(ctx, fmt.Sprintf("%s/%s", feedID, episodeName))
+				if sizeErr == nil {
+					logger.Infof("skipping cleaned episode (file still present on disk)")
+					return nil
+				}
+				// File is gone — fall through to filter check and re-queue below
+			} else {
+				// File already downloaded and present
+				logger.Infof("skipping due to already downloaded")
+				return nil
+			}
 		}
 
 		if !matchFilters(episode, &feedConfig.Filters) {
